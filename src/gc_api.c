@@ -2929,6 +2929,40 @@ paths_equal_ignoring_trailing_slash(const char *a, const char *b) {
   return alen == blen && memcmp(a, b, alen) == 0;
 }
 
+// ShadowMountPlus 1.2+ writes mount_img.lnk as one path per line for nested
+// images (outer .ffpfsc, then the inner image); older builds write one line.
+static int
+read_link_file_all(const char *path, char *out, size_t out_size) {
+  FILE *f = fopen(path, "r");
+  size_t len;
+  if(!f) return -1;
+  len = fread(out, 1, out_size - 1, f);
+  fclose(f);
+  out[len] = 0;
+  while(len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r' ||
+                    out[len - 1] == ' ')) {
+    out[--len] = 0;
+  }
+  return out[0] ? 0 : -1;
+}
+
+static int
+link_text_has_line(const char *text, const char *expected) {
+  char line[1024];
+  const char *p = text;
+  while(p && *p) {
+    size_t len = strcspn(p, "\r\n");
+    if(len > 0 && len < sizeof(line)) {
+      memcpy(line, p, len);
+      line[len] = 0;
+      if(paths_equal_ignoring_trailing_slash(line, expected)) return 1;
+    }
+    p += len;
+    p += strspn(p, "\r\n");
+  }
+  return 0;
+}
+
 static int
 system_ex_title_bound_to(const char *title_id,
                          const char *expected_mount_source,
@@ -2989,7 +3023,8 @@ wait_for_shadowmount_links(const char *title_id,
                            char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REMOUNT_WAIT_SECONDS;
   char mount_link[1024];
-  char image_link[1024];
+  char image_link[2048];
+  char image_link_path[1024];
   char actual_type[64];
   char actual_source[1024];
   char actual_mountpoint[1024];
@@ -3012,12 +3047,14 @@ wait_for_shadowmount_links(const char *title_id,
     }
     int has_mount = read_title_link(title_id, "mount.lnk", mount_link,
                                     sizeof(mount_link)) == 0;
-    int has_image = read_title_link(title_id, "mount_img.lnk", image_link,
-                                    sizeof(image_link)) == 0;
+    mount_link_path_for_title(title_id, "mount_img.lnk", image_link_path,
+                              sizeof(image_link_path));
+    int has_image = read_link_file_all(image_link_path, image_link,
+                                       sizeof(image_link)) == 0;
     int mount_ok = has_mount && expected_mount_link &&
         strcmp(mount_link, expected_mount_link) == 0;
     int image_ok = expected_image_link && expected_image_link[0]
-        ? (has_image && strcmp(image_link, expected_image_link) == 0)
+        ? (has_image && link_text_has_line(image_link, expected_image_link))
         : !has_image;
     int system_ex_ok = system_ex_title_bound_to(
         title_id, expected_mount_link, actual_type, sizeof(actual_type),
@@ -3362,7 +3399,7 @@ typedef struct gc_mount_link_backup {
   char mount_link_path[1024];
   char image_link_path[1024];
   char mount_value[1024];
-  char image_value[1024];
+  char image_value[2048];
   int had_mount;
   int had_image;
   int cleared;
@@ -6143,8 +6180,8 @@ mount_switch_clear_stale_links(const char *title_id,
       read_link_file(backup->mount_link_path, backup->mount_value,
                      sizeof(backup->mount_value)) == 0;
   backup->had_image =
-      read_link_file(backup->image_link_path, backup->image_value,
-                     sizeof(backup->image_value)) == 0;
+      read_link_file_all(backup->image_link_path, backup->image_value,
+                         sizeof(backup->image_value)) == 0;
 
   if(!backup->had_mount) return 0;
 
@@ -6153,8 +6190,7 @@ mount_switch_clear_stale_links(const char *title_id,
                                           expected_mount);
   image_matches = expected_image && expected_image[0]
       ? (backup->had_image &&
-         paths_equal_ignoring_trailing_slash(backup->image_value,
-                                             expected_image))
+         link_text_has_line(backup->image_value, expected_image))
       : !backup->had_image;
   if(mount_matches && image_matches) return 0;
 
