@@ -65,6 +65,8 @@
 #define GC_MOUNT_HIDE_PREFIX ".gc-hide-"
 #define GC_WORKER_THREAD_STACK_SIZE (1024 * 1024)
 #define GC_SYSTEM_APP_BASE "/system_ex/app"
+#define GC_SHADOWMOUNT_RUNTIME_SOCKET "/system_tmp/shadowmount.sock"
+#define GC_SHADOWMOUNT_HOLD_FILE GC_BASE "/shadowmount-runtime-hold"
 #define GC_SHADOW_PFSC_BASE "/mnt/shadowmnt/pfsc"
 #define GC_SHADOW_IMAGE_BASE "/mnt/shadowmnt"
 #define GC_SHADOW_CONFIG_FILE "/data/shadowmount/config.ini"
@@ -3016,6 +3018,96 @@ system_ex_title_bound_to(const char *title_id,
   return 1;
 }
 
+// ShadowMountPlus 1.7+ binds /system_ex/app/<title> only while a game is being
+// launched and drops it after every scan; its ShellCore bridge socket exists
+// only while that runtime is active.
+static int
+shadowmount_on_demand_runtime(void) {
+  struct stat st;
+  return stat(GC_SHADOWMOUNT_RUNTIME_SOCKET, &st) == 0 && S_ISSOCK(st.st_mode);
+}
+
+static void release_stale_shadowmount_runtime_hold(void);
+
+// On ShadowMountPlus 1.7+ a registered game is not mounted until launch, so
+// operations that read the mounted tree ask its API to mount the title and
+// release it afterwards. The marker lets startup release a hold left behind
+// by a crash; ShadowMountPlus refuses the release while the game is running.
+static int
+shadowmount_runtime_hold(const char *title_id, const char *mount_link,
+                         int *held, char *err, size_t err_size) {
+  char detail[256] = {0};
+  int rc;
+  FILE *f;
+
+  *held = 0;
+  if(!shadowmount_on_demand_runtime() ||
+     system_ex_title_bound_to(title_id, mount_link, NULL, 0, NULL, 0,
+                              NULL, 0)) {
+    return 0;
+  }
+  release_stale_shadowmount_runtime_hold();
+  f = fopen(GC_SHADOWMOUNT_HOLD_FILE, "w");
+  if(f) {
+    fprintf(f, "%s\n", title_id);
+    fclose(f);
+  }
+  job_set_phase("mounting", 0, 0, "Mounting with ShadowMountPlus");
+  rc = gc_shadowmount_api_mount_title(title_id, detail, sizeof(detail));
+  if(rc != 0) {
+    (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+    snprintf(err, err_size, "ShadowMountPlus could not mount %s: %s%s",
+             title_id, detail[0] ? detail : "unknown error",
+             rc == EBUSY ? " (close any running game and retry)" : "");
+    gc_log("shadowmount api mount failed title=%s rc=%d detail=%s",
+           title_id, rc, detail);
+    return -1;
+  }
+  *held = 1;
+  gc_log("shadowmount api mount title=%s bound=%d", title_id,
+         system_ex_title_bound_to(title_id, mount_link, NULL, 0, NULL, 0,
+                                  NULL, 0));
+  return 0;
+}
+
+static void
+shadowmount_runtime_release(const char *title_id, int *held) {
+  char detail[256] = {0};
+  int rc;
+
+  if(!*held) return;
+  *held = 0;
+  rc = gc_shadowmount_api_unmount_title(title_id, detail, sizeof(detail));
+  if(rc == 0) {
+    (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+    gc_log("shadowmount api unmount title=%s", title_id);
+    return;
+  }
+  gc_log("shadowmount api unmount failed title=%s rc=%d detail=%s",
+         title_id, rc, detail);
+}
+
+static void
+release_stale_shadowmount_runtime_hold(void) {
+  char title_id[32];
+  char detail[256] = {0};
+  int rc;
+
+  if(read_link_file(GC_SHADOWMOUNT_HOLD_FILE, title_id,
+                    sizeof(title_id)) != 0) {
+    return;
+  }
+  if(!valid_title_id(title_id)) {
+    (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+    return;
+  }
+  if(!shadowmount_on_demand_runtime()) return;
+  rc = gc_shadowmount_api_unmount_title(title_id, detail, sizeof(detail));
+  gc_log("shadowmount stale hold release title=%s rc=%d detail=%s",
+         title_id, rc, detail);
+  if(rc >= 0) (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+}
+
 static int
 wait_for_shadowmount_links(const char *title_id,
                            const char *expected_mount_link,
@@ -3063,6 +3155,15 @@ wait_for_shadowmount_links(const char *title_id,
 
     if(mount_ok && image_ok && system_ex_ok) {
       gc_log("shadowmount ready title=%s mount=%s image=%s system_ex=%s:%s",
+             title_id ? title_id : "", mount_link,
+             has_image ? image_link : "",
+             actual_type[0] ? actual_type : "(unknown)",
+             actual_source[0] ? actual_source : "(unknown)");
+      return 0;
+    }
+    if(mount_ok && image_ok && shadowmount_on_demand_runtime()) {
+      gc_log("shadowmount ready title=%s mount=%s image=%s "
+             "system_ex=on-demand:%s:%s",
              title_id ? title_id : "", mount_link,
              has_image ? image_link : "",
              actual_type[0] ? actual_type : "(unknown)",
@@ -7823,6 +7924,7 @@ run_extract_image_op(gc_operation_t *op) {
   uint64_t copied = 0;
   size_t hidden_count = 0;
   int mount_missed = 0;
+  int runtime_held = 0;
 
   gc_checkpoint("extract find game");
   gc_log("extract start op=%s title=%s", op->id, op->title_id);
@@ -7837,8 +7939,7 @@ run_extract_image_op(gc_operation_t *op) {
   }
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s", "image");
-  if(!game.is_mounted || !game.mount_path[0] ||
-     stat(game.mount_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+  if(!game.is_mounted || !game.mount_path[0]) {
     snprintf(op->error, sizeof(op->error), "%s",
              "image must be mounted before extract");
     gc_log("extract failed title=%s err=%s", op->title_id, op->error);
@@ -7893,12 +7994,30 @@ run_extract_image_op(gc_operation_t *op) {
     return -1;
   }
   remove_tree_gc(temp_path);
+  if(shadowmount_runtime_hold(game.title_id, game.mount_path, &runtime_held,
+                              err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", err);
+    gc_log("extract mount failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(stat(game.mount_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    shadowmount_runtime_release(game.title_id, &runtime_held);
+    snprintf(op->error, sizeof(op->error), "%s",
+             "image must be mounted before extract");
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
   append_operation_phase(op, "copying");
   job_set_phase("copying", 0, 0, "Extracting mounted image");
   job_store_u64(&g_job.total_bytes, game.source_size);
   atomic_store(&g_job.copied_bytes, 0);
   gc_checkpoint("extract copy");
-  if(copy_tree_gc(game.mount_path, temp_path, &copied, err, sizeof(err)) != 0) {
+  int copy_rc = copy_tree_gc(game.mount_path, temp_path, &copied,
+                             err, sizeof(err));
+  // Release before the output is registered: a held runtime mount makes
+  // ShadowMountPlus reject the remount below.
+  shadowmount_runtime_release(game.title_id, &runtime_held);
+  if(copy_rc != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "extract failed");
     remove_tree_gc(temp_path);
@@ -8957,7 +9076,7 @@ run_set_read_only_op(gc_operation_t *op) {
 }
 
 static int
-run_read_speed_test_op(gc_operation_t *op) {
+run_read_speed_test_op_held(gc_operation_t *op, int *runtime_held) {
   gc_game_t game = {0};
   gc_read_speed_ctx_t ctx;
   struct stat st;
@@ -8978,6 +9097,14 @@ run_read_speed_test_op(gc_operation_t *op) {
   }
   if(gc_cancel_requested(err, sizeof(err))) {
     snprintf(op->error, sizeof(op->error), "%s", err);
+    return -1;
+  }
+  if(game.is_mounted && game.mount_path[0] &&
+     shadowmount_runtime_hold(game.title_id, game.mount_path, runtime_held,
+                              err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", err);
+    gc_log("read-speed mount failed title=%s err=%s", op->title_id,
+           op->error);
     return -1;
   }
   if(read_speed_mount_root(&game, read_root, sizeof(read_root),
@@ -9070,6 +9197,14 @@ run_read_speed_test_op(gc_operation_t *op) {
          (unsigned long long)ctx.files_opened);
   free(ctx.buf);
   return 0;
+}
+
+static int
+run_read_speed_test_op(gc_operation_t *op) {
+  int runtime_held = 0;
+  int rc = run_read_speed_test_op_held(op, &runtime_held);
+  shadowmount_runtime_release(op->title_id, &runtime_held);
+  return rc;
 }
 
 static int
@@ -12243,6 +12378,7 @@ void
 gc_api_recover_on_startup(void) {
   cleanup_force_remount_temps_on_startup();
   cleanup_delete_pending_temps_on_startup();
+  release_stale_shadowmount_runtime_hold();
   mount_switch_restore_recovery_log();
   recover_interrupted_history(GC_HISTORY_LOG);
 }
