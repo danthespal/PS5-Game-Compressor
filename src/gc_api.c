@@ -67,6 +67,7 @@
 #define GC_SYSTEM_APP_BASE "/system_ex/app"
 #define GC_SHADOWMOUNT_RUNTIME_SOCKET "/system_tmp/shadowmount.sock"
 #define GC_SHADOWMOUNT_HOLD_FILE GC_BASE "/shadowmount-runtime-hold"
+#define GC_SHADOWMOUNT_HOLD_BUSY_SECONDS 30
 #define GC_SHADOW_PFSC_BASE "/mnt/shadowmnt/pfsc"
 #define GC_SHADOW_IMAGE_BASE "/mnt/shadowmnt"
 #define GC_SHADOW_CONFIG_FILE "/data/shadowmount/config.ini"
@@ -3034,14 +3035,18 @@ static void release_stale_shadowmount_runtime_hold(void);
 // release it afterwards. The marker lets startup release a hold left behind
 // by a crash; ShadowMountPlus refuses the release while the game is running.
 static int
-shadowmount_runtime_hold(const char *title_id, const char *mount_link,
-                         int *held, char *err, size_t err_size) {
+shadowmount_runtime_hold(const char *title_id, int *held,
+                         char *err, size_t err_size) {
   char detail[256] = {0};
+  char mount_link[1024];
+  time_t busy_deadline = time(NULL) + GC_SHADOWMOUNT_HOLD_BUSY_SECONDS;
   int rc;
   FILE *f;
 
   *held = 0;
-  if(!shadowmount_on_demand_runtime() ||
+  if(!valid_title_id(title_id) || !shadowmount_on_demand_runtime() ||
+     read_title_link(title_id, "mount.lnk", mount_link,
+                     sizeof(mount_link)) != 0 ||
      system_ex_title_bound_to(title_id, mount_link, NULL, 0, NULL, 0,
                               NULL, 0)) {
     return 0;
@@ -3053,7 +3058,16 @@ shadowmount_runtime_hold(const char *title_id, const char *mount_link,
     fclose(f);
   }
   job_set_phase("mounting", 0, 0, "Mounting with ShadowMountPlus");
-  rc = gc_shadowmount_api_mount_title(title_id, detail, sizeof(detail));
+  while(1) {
+    detail[0] = 0;
+    rc = gc_shadowmount_api_mount_title(title_id, detail, sizeof(detail));
+    // EBUSY is also returned while a scan or release is still in progress.
+    if(rc != EBUSY || time(NULL) >= busy_deadline) break;
+    if(gc_sleep_cancelable_seconds(1, err, err_size) != 0) {
+      (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+      return -1;
+    }
+  }
   if(rc != 0) {
     (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
     snprintf(err, err_size, "ShadowMountPlus could not mount %s: %s%s",
@@ -5143,8 +5157,8 @@ prepare_uncompress_plan(gc_game_t *game, int as_image,
 }
 
 static int
-repair_with_wait(const char *title_id, const char *path,
-                 pfs_repair_info_t *info, char *err, size_t err_size) {
+repair_with_wait_mounted(const char *title_id, const char *path,
+                         pfs_repair_info_t *info, char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REPAIR_WAIT_SECONDS;
   gc_checkpoint("repair waiting for mount");
   gc_log("repair wait title=%s path=%s", title_id ? title_id : "",
@@ -5187,10 +5201,25 @@ repair_with_wait(const char *title_id, const char *path,
   }
 }
 
+// Repair reads the nested image through ShadowMountPlus' decompressed PFSC
+// mount, which ShadowMountPlus 1.7+ only keeps while the title is mounted.
 static int
-repair_scan_only_with_wait(const char *title_id, const char *path,
-                           pfs_repair_info_t *info, int *scan_rc_out,
-                           char *err, size_t err_size) {
+repair_with_wait(const char *title_id, const char *path,
+                 pfs_repair_info_t *info, char *err, size_t err_size) {
+  int runtime_held = 0;
+  int rc;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
+  rc = repair_with_wait_mounted(title_id, path, info, err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  return rc;
+}
+
+static int
+repair_scan_only_with_wait_mounted(const char *title_id, const char *path,
+                                   pfs_repair_info_t *info, int *scan_rc_out,
+                                   char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REPAIR_WAIT_SECONDS;
   gc_checkpoint("validate-only waiting for mount");
   gc_log("validate-only wait title=%s path=%s", title_id ? title_id : "",
@@ -5235,6 +5264,21 @@ repair_scan_only_with_wait(const char *title_id, const char *path,
 }
 
 static int
+repair_scan_only_with_wait(const char *title_id, const char *path,
+                           pfs_repair_info_t *info, int *scan_rc_out,
+                           char *err, size_t err_size) {
+  int runtime_held = 0;
+  int rc;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
+  rc = repair_scan_only_with_wait_mounted(title_id, path, info, scan_rc_out,
+                                          err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  return rc;
+}
+
+static int
 post_repair_smoke_verify(const char *title_id, const char *path,
                          pfs_repair_info_t *info, int remount_ready,
                          char *err, size_t err_size) {
@@ -5257,8 +5301,14 @@ post_repair_smoke_verify(const char *title_id, const char *path,
       return -1;
     }
   }
+  int runtime_held = 0;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
   job_set_phase("validating", 0, 0, "Smoke verifying repaired blocks");
-  if(pfs_repair_ffpfsc_smoke_verify(path, info, err, err_size) != 0) {
+  int verify_rc = pfs_repair_ffpfsc_smoke_verify(path, info, err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  if(verify_rc != 0) {
     gc_log("repair smoke verify failed title=%s err=%s",
            title_id ? title_id : "", err && err[0] ? err : "unknown");
     return -1;
@@ -7994,7 +8044,7 @@ run_extract_image_op(gc_operation_t *op) {
     return -1;
   }
   remove_tree_gc(temp_path);
-  if(shadowmount_runtime_hold(game.title_id, game.mount_path, &runtime_held,
+  if(shadowmount_runtime_hold(game.title_id, &runtime_held,
                               err, sizeof(err)) != 0) {
     snprintf(op->error, sizeof(op->error), "%s", err);
     gc_log("extract mount failed title=%s err=%s", op->title_id, op->error);
@@ -9100,7 +9150,7 @@ run_read_speed_test_op_held(gc_operation_t *op, int *runtime_held) {
     return -1;
   }
   if(game.is_mounted && game.mount_path[0] &&
-     shadowmount_runtime_hold(game.title_id, game.mount_path, runtime_held,
+     shadowmount_runtime_hold(game.title_id, runtime_held,
                               err, sizeof(err)) != 0) {
     snprintf(op->error, sizeof(op->error), "%s", err);
     gc_log("read-speed mount failed title=%s err=%s", op->title_id,
